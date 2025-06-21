@@ -1,0 +1,899 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include <mbedtls/md.h> // For HMAC and SHA384
+
+// Include the ST7789 display library
+#include "Display_ST7789.h"
+
+// Include Adafruit GFX and ST7789 libraries for text renderingf
+
+#include <Adafruit_GFX.h>    // Core graphics library
+#include <Adafruit_ST7789.h> // Hardware-specific library for ST7789
+#include <SPI.h> // Required for Adafruit SPI communication
+
+// Define LCD pins for Adafruit library (these should match your Display_ST7789.h defines)
+#define TFT_CS   EXAMPLE_PIN_NUM_LCD_CS  // Chip select pin
+#define TFT_DC   EXAMPLE_PIN_NUM_LCD_DC  // Data/command pin
+#define TFT_RST  EXAMPLE_PIN_NUM_LCD_RST // Reset pin
+
+// Initialize Adafruit ST7789 library with your pins.
+// Note: This uses the Adafruit library for text rendering, while Display_ST7789.cpp
+// is used for the basic display initialization and window operations.
+Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
+
+
+// Minimal Base64 implementation for URL-safe encoding
+// This is a simplified version; for robust applications, consider a dedicated library.
+// For ESP32, you might find a more complete base64 utility built-in or a library
+// that can do URL-safe directly. This manual replacement approach is common.
+namespace base64 {
+    static const char* encoding = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    static const char* decoding = "===========================================+/====0123456789===="
+                                  "====ABCDEFGHIJKLMNOPQRSTUVWXYZ======abcdefghijklmnopqrstuvwxyz";
+
+    String encode(const String& data) {
+        String encoded = "";
+        int val = 0, valb = -6;
+        for (char c : data) {
+            val = (val << 8) + c;
+            valb += 8;
+            while (valb >= 0) {
+                encoded += encoding[(val >> valb) & 0x3F];
+                valb -= 6;
+            }
+        }
+        if (valb > -6) {
+            encoded += encoding[((val << 8) >> (valb + 8)) & 0x3F];
+        }
+        while (encoded.length() % 4 != 0) {
+            encoded += '=';
+        }
+        return encoded;
+    }
+
+    // A simple decode function, mainly for verifying the payload during debugging
+    String decode(const String& data) {
+        String decoded = "";
+        int val = 0, valb = -8;
+        for (char c : data) {
+            if (c == '=') break; // Stop at padding
+            val = (val << 6) + (strchr(encoding, c) - encoding);
+            valb += 6;
+            if (valb >= 0) {
+                decoded += char((val >> valb) & 0xFF);
+                valb -= 8;
+            }
+        }
+        return decoded;
+    }
+}
+
+// --- WiFi Configuration ---
+const char* ssid = "XXXXX";        // Your WiFi SSID
+const char* password = "XXXXX"; // Your WiFi Password
+
+// --- Bitopro API Credentials ---
+const char* apiKey = "XXXXX";
+const char* apiSecret = "XXXXX";
+const char* baseUrl = "https://api.bitopro.com/v3";
+const char* email = "XXXXX"; // Email for balance and history
+
+// --- NTP Client Setup ---
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 0, 60000); // UTC offset 0, update interval 60s (milliseconds)
+
+// --- Global variables for API communication ---
+// For buy/sell orders. Note: The endpoint path is hardcoded as "btc_twd" in lowercase.
+const char* orderEndpointPair = "btc_twd";
+// For ticker information (e.g., getting current price). Often uses uppercase.
+const char* tickerPair = "BTC_TWD";
+const char* endpoint = "/orders/btc_twd"; // Endpoint for placing orders
+String completeUrl; // Complete URL for the order endpoint
+
+// Variables for periodic price updates
+unsigned long lastPriceUpdateTime = 0;
+const long priceUpdateInterval = 5000; // Update price every 5 seconds (in milliseconds)
+
+// Trading logic variables
+float TMP_QTY = 0.0003; // Initial amount for buy orders
+float MEAN_INV_PRICE = 0.0; // Mean of all historical buy prices
+float l5mean_price = 0.0; // Mean of the latest 5 historical buy prices
+float CUR_PRICE = 0.0; // Current price
+float BTC_BALANCE = 0.0; // BTC balance
+int lastBuyHour = 0; // for daily buy
+
+
+// Colors for the display
+#define ST77XX_BLACK 0x0000
+#define ST77XX_WHITE 0xFFFF
+#define ST77XX_RED   0xF800
+#define ST77XX_GREEN 0x07E0
+#define ST77XX_BLUE  0x001F
+#define ST77XX_CYAN  0x07FF
+#define ST77XX_MAGENTA 0xF81F
+#define ST77XX_YELLOW 0xFFE0
+#define ST77XX_ORANGE 0xFD20
+
+// Function to display text on the LCD
+void displayTextOnLCD(String text, uint16_t color, uint16_t background, int size, int x, int y) {
+  BLINK();
+  tft.setTextWrap(true); // Wrap text if it exceeds screen width
+  tft.fillScreen(background); // Clear the screen with the background color
+  tft.setCursor(x, y);        // Set cursor position
+  tft.setTextColor(color);    // Set text color
+  tft.setTextSize(size);      // Set text size
+  tft.print(text);            // Print the text
+}
+
+// Function to perform URL-safe Base64 encoding
+// This replaces '+' with '-', '/' with '_', and leaves '=' padding as is.
+String base64UrlEncode(const String& input) {
+  String encoded = base64::encode(input); // Use a generic base64 encoder
+  encoded.replace('+', '-');
+  encoded.replace('/', '_');
+  // IMPORTANT: Do NOT remove '=' padding or replace with '\0'.
+  // The Python reference shows padding, and this is standard for URL-safe Base64.
+  return encoded;
+}
+
+// Function to compute HMAC-SHA384 signature
+String generateHmacSha384(const String& key, const String& data) {
+    mbedtls_md_context_t ctx;
+    mbedtls_md_info_t const *info;
+    unsigned char hmacResult[48]; // SHA384 produces a 48-byte hash (384 bits)
+
+    // Convert key to String to ensure consistent handling
+    String keyString = key;
+
+    Serial.print("HMAC Key (Hex): ");
+    for (size_t i = 0; i < keyString.length(); ++i) {
+        Serial.printf("%02x", keyString.c_str()[i]);
+    }
+    Serial.println();
+
+    Serial.print("HMAC Data (Hex): ");
+    // Ensure we are using the actual length of the string data, not potentially beyond a null terminator.
+    for (size_t i = 0; i < data.length(); ++i) {
+        Serial.printf("%02x", data.c_str()[i]);
+    }
+    Serial.println();
+
+    mbedtls_md_init(&ctx);
+    info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA384);
+    if (info == NULL) {
+        Serial.println("Error: MD info from type is NULL");
+        return "";
+    }
+
+    if (mbedtls_md_setup(&ctx, info, 1) != 0) { // 1 for HMAC
+        Serial.println("Error: MD setup failed");
+        return "";
+    }
+
+    // Use keyString.c_str() and keyString.length() for HMAC
+    if (mbedtls_md_hmac_starts(&ctx, (const unsigned char*)keyString.c_str(), keyString.length()) != 0) {
+        Serial.println("Error: HMAC starts failed");
+        mbedtls_md_free(&ctx);
+        return "";
+    }
+
+    // Pass the actual length of the data String to mbedtls_md_hmac_update
+    if (mbedtls_md_hmac_update(&ctx, (const unsigned char*)data.c_str(), data.length()) != 0) {
+        Serial.println("Error: HMAC update failed");
+        mbedtls_md_free(&ctx);
+        return "";
+    }
+
+    if (mbedtls_md_hmac_finish(&ctx, hmacResult) != 0) {
+        Serial.println("Error: HMAC finish failed");
+        mbedtls_md_free(&ctx);
+        return "";
+    }
+
+    mbedtls_md_free(&ctx);
+
+    String signature = "";
+    for (int i = 0; i < sizeof(hmacResult); i++) {
+        char buf[3];
+        sprintf(buf, "%02x", hmacResult[i]);
+        signature += buf;
+    }
+    return signature;
+}
+
+
+// Function to send HTTP requests to the BitoPro API
+// This overloaded version handles requests with a JSON body (e.g., POST)
+StaticJsonDocument<1024> sendRequest(const char* method, const String& url, const String& payloadStr, const String& signature, const String& requestBody = "") {
+  HTTPClient http;
+  http.begin(url);
+  http.setTimeout(15000); // Set a timeout for the request (15 seconds)
+
+  // Set necessary HTTP headers for BitoPro API authentication
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-BITOPRO-APIKEY", apiKey);
+  http.addHeader("X-BITOPRO-PAYLOAD", payloadStr);
+  http.addHeader("X-BITOPRO-SIGNATURE", signature);
+
+  Serial.print("Sending ");
+  Serial.print(method);
+  Serial.print(" request to: ");
+  Serial.println(url);
+  Serial.print("Payload (Header): ");
+  Serial.println(payloadStr);
+  Serial.print("Signature: ");
+  Serial.println(signature);
+
+
+  int httpResponseCode = -1;
+  String responsePayload = "";
+
+  if (strcmp(method, "POST") == 0) {
+    Serial.print("POST Body: ");
+    Serial.println(requestBody);
+    httpResponseCode = http.POST(requestBody); // Send the POST request with the JSON body
+    responsePayload = http.getString(); // Get the response from the server
+  } else if (strcmp(method, "GET") == 0) {
+    httpResponseCode = http.GET(); // Send the GET request
+    responsePayload = http.getString(); // Get the response from the server
+  } else if (strcmp(method, "DELETE") == 0) { // Added for DELETE requests
+    httpResponseCode = http.sendRequest("DELETE", requestBody); // Send the DELETE request
+    responsePayload = http.getString(); // Get the response from the server
+  }
+  // Other methods (PUT) can be added here if needed for other API interactions
+
+  http.end(); // Close the connection and free resources
+
+  StaticJsonDocument<1024> doc; // Create a StaticJsonDocument to parse the HTTP response
+  if (httpResponseCode > 0) {
+    Serial.print("HTTP Response Code: ");
+    Serial.println(httpResponseCode);
+    Serial.print("Response Payload: ");
+    Serial.println(responsePayload);
+
+    if (httpResponseCode == HTTP_CODE_OK || httpResponseCode == HTTP_CODE_NO_CONTENT) { // Check if the request was successful (HTTP 200 OK or 204 No Content for DELETE)
+      DeserializationError error = deserializeJson(doc, responsePayload);
+      if (error) {
+        Serial.print(F("deserializeJson() failed: "));
+        Serial.println(error.f_str());
+        displayTextOnLCD("JSON parse failed!", ST77XX_RED, ST77XX_BLACK, 2, 0, 20);
+      }
+    } else {
+      Serial.print("Error: ");
+      Serial.println(httpResponseCode);
+      String errorMessage = "HTTP Error: " + String(httpResponseCode);
+      displayTextOnLCD(errorMessage, ST77XX_RED, ST77XX_BLACK, 2, 0, 20);
+    }
+  } else {
+    Serial.print("HTTP Request failed: ");
+    Serial.println(httpResponseCode);
+    String errorMessage = "Request Failed: " + String(httpResponseCode);
+    displayTextOnLCD(errorMessage, ST77XX_RED, ST77XX_BLACK, 2, 0, 20);
+  }
+  return doc; // Return the parsed JSON document (or null if error)
+}
+
+// Overloaded version for GET requests that don't have a specific request body for the HTTP client
+StaticJsonDocument<1024> sendRequest(const char* method, const String& url, const String& payloadStr, const String& signature) {
+    return sendRequest(method, url, payloadStr, signature, "");
+}
+
+
+// Function to get the current price from BitoPro API's ticker endpoint
+float GET_CUR_PRICE() {
+  // Ensure WiFi is connected before making HTTP requests
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected. Reconnecting...");
+    displayTextOnLCD("WiFi not connected. Reconnecting...", ST77XX_WHITE, ST77XX_BLACK, 2, 0, 20);
+    WiFi.begin(ssid, password);
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) { // Try for max 10 seconds
+      delay(500);
+      Serial.print(".");
+      attempts++;
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("\nWiFi reconnected!");
+      displayTextOnLCD("WiFi reconnected!", ST77XX_GREEN, ST77XX_BLACK, 2, 0, 20);
+    } else {
+      Serial.println("\nFailed to reconnect to WiFi.");
+      displayTextOnLCD("Failed to reconnect to WiFi.", ST77XX_RED, ST77XX_BLACK, 2, 0, 20);
+      return 0.0;
+    }
+  }
+
+  HTTPClient http; // Declare an HTTPClient object for this request
+
+  // Construct the URL using the 'tickerPair' variable (e.g., "BTC_TWD")
+  String url = "https://api.bitopro.com/v3/tickers/";
+  url += tickerPair;
+
+  http.begin(url); // Specify the URL for the GET request
+
+  int httpResponseCode = http.GET(); // Send the HTTP GET request
+
+  float price = 0.0; // Initialize price to 0.0
+
+  // Check the status code of the HTTP request
+  if (httpResponseCode == HTTP_CODE_OK) { // HTTP_CODE_OK == 200
+    String payload = http.getString(); // Get the response payload (JSON string)
+    
+    // Parse the JSON response using DynamicJsonDocument for flexibility
+    DynamicJsonDocument doc(1024); // Allocate a JSON document buffer (adjust size if needed)
+
+    // Deserialize the JSON. Check if parsing was successful.
+    DeserializationError error = deserializeJson(doc, payload);
+
+    if (error) {
+      Serial.print(F("deserializeJson() failed for price: "));
+      Serial.println(error.f_str());
+      Serial.println("Failed to parse JSON response for current price.");
+      displayTextOnLCD("Failed to parse price JSON.", ST77XX_RED, ST77XX_BLACK, 2, 0, 20);
+    } else {
+      // Access the data and lastPrice fields from the JSON response
+      // Expected structure: {"data": {"lastPrice": "12345.67"}}
+      if (doc.containsKey("data") && doc["data"].containsKey("lastPrice")) {
+        // Convert the lastPrice string to a float
+        price = doc["data"]["lastPrice"].as<float>();
+        String priceString = "Current Price:\n" + String(price, 2) + " TWD";
+        Serial.print("Current Price of ");
+        Serial.print(tickerPair);
+        Serial.print(": ");
+        Serial.println(price, 2); // Print with 2 decimal places
+        // displayTextOnLCD(priceString, ST77XX_GREEN, ST77XX_BLACK, 2, 0, 20); // Display on LCD
+      } else {
+        Serial.println("JSON response missing 'data' or 'lastPrice' field for current price.");
+        displayTextOnLCD("Price data missing!", ST77XX_RED, ST77XX_BLACK, 2, 0, 20);
+      }
+    }
+  } else {
+    Serial.print("Error code when fetching price: ");
+    Serial.println(httpResponseCode);
+    Serial.println("No current price received.");
+    String errorMessage = "Price Fetch Error: " + String(httpResponseCode);
+    displayTextOnLCD(errorMessage, ST77XX_RED, ST77XX_BLACK, 2, 0, 20);
+  }
+
+  http.end(); // Free resources associated with this HTTPClient instance
+  return price; // Return the fetched price
+}
+
+
+// Function to send a buy order to BitoPro
+void sendBuyOrder(float amount, float price) {
+  // Update NTP client right before using the timestamp to ensure maximum freshness
+  timeClient.update();
+
+  // Generate payload for the order
+  StaticJsonDocument<512> params; // Use StaticJsonDocument for fixed size to save memory
+  params["action"] = "BUY";
+  params["amount"] = String(amount, 8); // Use 8 decimal places for amount
+  params["price"] = String(price, 2); // Use 2 decimal places for price
+  // Get current timestamp in milliseconds (NTPClient provides seconds, so multiply by 1000)
+  params["timestamp"] = (uint64_t)timeClient.getEpochTime() * 1000ULL; // Use ULL for unsigned long long literal
+  params["type"] = "LIMIT";
+  params["timeInForce"] = "POST_ONLY";
+
+  // Manually construct paramsJson to ensure the exact JSON string format required by the API
+  // This includes spaces between key-value pairs, matching Python's json.dumps behavior.
+  String paramsJson = "{";
+  paramsJson += "\"action\": \"" + String(params["action"].as<const char*>()) + "\", ";
+  paramsJson += "\"amount\": \"" + String(params["amount"].as<const char*>()) + "\", ";
+  paramsJson += "\"price\": \"" + String(params["price"].as<const char*>()) + "\", ";
+  paramsJson += "\"timestamp\": " + String(params["timestamp"].as<uint64_t>()) + ", ";
+  paramsJson += "\"type\": \"" + String(params["type"].as<const char*>()) + "\", ";
+  paramsJson += "\"timeInForce\": \"" + String(params["timeInForce"].as<const char*>()) + "\"";
+  paramsJson += "}";
+
+  Serial.print("Original JSON Payload (BUY): ");
+  Serial.println(paramsJson);
+
+  // Base64 URL-safe encode the payload string for the X-BITOPRO-PAYLOAD header
+  String payload = base64UrlEncode(paramsJson);
+  Serial.print("Base64 URL-safe Encoded Payload (X-BITOPRO-PAYLOAD for BUY): ");
+  Serial.println(payload);
+
+  // Generate the HMAC-SHA384 signature using the API secret and the encoded payload
+  String signature = generateHmacSha384(apiSecret, payload);
+  Serial.print("HMAC-SHA384 Signature (X-BITOPRO-SIGNATURE for BUY): ");
+  Serial.println(signature);
+
+  displayTextOnLCD("Sending BUY order...", ST77XX_YELLOW, ST77XX_BLACK, 2, 0, 20);
+
+  // Send the HTTP POST request to the BitoPro API
+  StaticJsonDocument<1024> response = sendRequest("POST", completeUrl, payload, signature, paramsJson);
+
+  if (!response.isNull()) {
+    Serial.println("Buy Order created:");
+    serializeJsonPretty(response, Serial); // Print the full API response in a human-readable format
+    Serial.println();
+    String orderStatus = response["status"].as<String>();
+    String orderId = response["orderId"].as<String>();
+    String displayMessage = "BUY Order " + orderStatus;
+    if (orderId.length() > 0) {
+      displayMessage += "\nID: " + orderId;
+    }
+    displayTextOnLCD(displayMessage, ST77XX_BLUE, ST77XX_BLACK, 2, 0, 20);
+  } else {
+    Serial.println("Failed to create buy order or response was empty.");
+    displayTextOnLCD("BUY Order failed!", ST77XX_RED, ST77XX_BLACK, 2, 0, 20);
+  }
+}
+
+// Function to send a sell order to BitoPro
+void sendSellOrder(float amount, float price) {
+  // Update NTP client right before using the timestamp to ensure maximum freshness
+  timeClient.update();
+
+  // Generate payload for the order
+  StaticJsonDocument<512> params; // Use StaticJsonDocument for fixed size to save memory
+  params["action"] = "SELL";
+  params["amount"] = String(amount, 8); // Use 8 decimal places for amount
+  params["price"] = String(price, 2); // Use 2 decimal places for price
+  // Get current timestamp in milliseconds (NTPClient provides seconds, so multiply by 1000)
+  params["timestamp"] = (uint64_t)timeClient.getEpochTime() * 1000ULL; // Use ULL for unsigned long long literal
+  params["type"] = "LIMIT";
+  params["timeInForce"] = "POST_ONLY";
+
+  // Manually construct paramsJson to ensure the exact JSON string format required by the API
+  // This includes spaces between key-value pairs, matching Python's json.dumps behavior.
+  String paramsJson = "{";
+  paramsJson += "\"action\": \"" + String(params["action"].as<const char*>()) + "\", ";
+  paramsJson += "\"amount\": \"" + String(params["amount"].as<const char*>()) + "\", ";
+  paramsJson += "\"price\": \"" + String(params["price"].as<const char*>()) + "\", ";
+  paramsJson += "\"timestamp\": " + String(params["timestamp"].as<uint64_t>()) + ", ";
+  paramsJson += "\"type\": \"" + String(params["type"].as<const char*>()) + "\", ";
+  paramsJson += "\"timeInForce\": \"" + String(params["timeInForce"].as<const char*>()) + "\"";
+  paramsJson += "}";
+
+  Serial.print("Original JSON Payload (SELL): ");
+  Serial.println(paramsJson);
+
+  // Base64 URL-safe encode the payload string for the X-BITOPRO-PAYLOAD header
+  String payload = base64UrlEncode(paramsJson);
+  Serial.print("Base64 URL-safe Encoded Payload (X-BITOPRO-PAYLOAD for SELL): ");
+  Serial.println(payload);
+
+  // Generate the HMAC-SHA384 signature using the API secret and the encoded payload
+  String signature = generateHmacSha384(apiSecret, payload);
+  Serial.print("HMAC-SHA384 Signature (X-BITOPRO-SIGNATURE for SELL): ");
+  Serial.println(signature);
+
+  displayTextOnLCD("Sending SELL order...", ST77XX_YELLOW, ST77XX_BLACK, 2, 0, 20);
+
+  // Send the HTTP POST request to the BitoPro API
+  StaticJsonDocument<1024> response = sendRequest("POST", completeUrl, payload, signature, paramsJson);
+
+  if (!response.isNull()) {
+    Serial.println("Sell Order created:");
+    serializeJsonPretty(response, Serial); // Print the full API response in a human-readable format
+    Serial.println();
+    String orderStatus = response["status"].as<String>();
+    String orderId = response["orderId"].as<String>();
+    String displayMessage = "SELL Order " + orderStatus;
+    if (orderId.length() > 0) {
+      displayMessage += "\nID: " + orderId;
+    }
+    displayTextOnLCD(displayMessage, ST77XX_BLUE, ST77XX_BLACK, 2, 0, 20);
+  } else {
+    Serial.println("Failed to create sell order or response was empty.");
+    displayTextOnLCD("SELL Order failed!", ST77XX_RED, ST77XX_BLACK, 2, 0, 20);
+  }
+}
+
+// Function to get account balance from BitoPro API
+float getBalance(bool printToSerial = true) {
+    timeClient.update(); // Ensure timestamp is fresh
+    // Ensure nonce is a positive 64-bit unsigned integer
+    uint64_t nonce = (uint64_t)timeClient.getEpochTime() * 1000ULL; // Use ULL for unsigned long long literal
+
+    // Manually construct JSON string to ensure exact formatting with spaces
+    String paramsJson = "{\"identity\": \"";
+    paramsJson += String(email);
+    paramsJson += "\", \"nonce\": "; // Note the space after colon
+    paramsJson += String(nonce);
+    paramsJson += "}";
+
+    String payload = base64UrlEncode(paramsJson);
+    String signature = generateHmacSha384(apiSecret, payload);
+
+    String url = String(baseUrl) + "/accounts/balance";
+
+    if (printToSerial) {
+        displayTextOnLCD("Fetching Balance...", ST77XX_YELLOW, ST77XX_BLACK, 2, 0, 20);
+        Serial.println("\nFetching Balance...");
+    }
+
+    // Explicitly pass an empty String for the requestBody to resolve ambiguity
+    StaticJsonDocument<1024> response = sendRequest("GET", url, payload, signature, "");
+
+    float btc_available = 0.0;
+    if (!response.isNull() && response.containsKey("data")) {
+        if (printToSerial) {
+            Serial.println("Account Balance:");
+        }
+        JsonArray balances = response["data"].as<JsonArray>();
+        String displayMessage = "Balances:\n";
+        int lineCount = 0;
+        for (JsonObject balance : balances) {
+            String currency = balance["currency"].as<String>();
+            String amount = balance["amount"].as<String>();
+            String available = balance["available"].as<String>();
+            if (printToSerial) {
+                Serial.printf("  %s: Amount=%s, Available=%s\n", currency.c_str(), amount.c_str(), available.c_str());
+            }
+            if (currency == "btc") {
+                btc_available = available.toFloat();
+            }
+            if (printToSerial && lineCount < 3) { // Limit display to 3 lines on LCD for brevity
+                displayMessage += currency + ": " + available + "\n";
+                lineCount++;
+            }
+        }
+        if (printToSerial) {
+            displayTextOnLCD(displayMessage, ST77XX_CYAN, ST77XX_BLACK, 2, 0, 20);
+        }
+    } else {
+        if (printToSerial) {
+            Serial.println("Failed to get balance or no data found.");
+            displayTextOnLCD("Balance fetch failed!", ST77XX_RED, ST77XX_BLACK, 2, 0, 20);
+        }
+    }
+    return btc_available;
+}
+
+// Function to get trade history from BitoPro API and calculate mean prices
+void getTradeHistoryMeanPrices(bool printToSerial = true) {
+    timeClient.update(); // Ensure timestamp is fresh
+    // Ensure nonce is a positive 64-bit unsigned integer
+    uint64_t nonce = (uint64_t)timeClient.getEpochTime() * 1000ULL; // Use ULL for unsigned long long literal
+    uint64_t current_time_ms = (uint64_t)timeClient.getEpochTime() * 1000ULL; // Use ULL for unsigned long long literal
+    // Calculate 90 days ago in milliseconds. (89 days is used in Python code, let's keep it consistent)
+    uint64_t ninety_days_ago_ms = current_time_ms - (89ULL * 24ULL * 60ULL * 60ULL * 1000ULL); // Use ULL for all literals
+
+    // Manually construct JSON string to ensure exact formatting with spaces
+    String paramsJson = "{\"identity\": \"";
+    paramsJson += String(email);
+    paramsJson += "\", \"nonce\": "; // Note the space after colon
+    paramsJson += String(nonce);
+    paramsJson += "}";
+
+    String payload = base64UrlEncode(paramsJson);
+    String signature = generateHmacSha384(apiSecret, payload);
+
+    String url = String(baseUrl) + "/orders/trades/" + orderEndpointPair + "?limit=20&startTimestamp=" + String(ninety_days_ago_ms) + "&endTimestamp=" + String(current_time_ms);
+
+    if (printToSerial) {
+        displayTextOnLCD("Fetching History...", ST77XX_YELLOW, ST77XX_BLACK, 2, 0, 20);
+        Serial.println("\nFetching Trade History...");
+        Serial.print("Trade History URL: ");
+        Serial.println(url); // Print the full URL to verify timestamps
+    }
+
+    // Explicitly pass an empty String for the requestBody to resolve ambiguity
+    StaticJsonDocument<1024> response = sendRequest("GET", url, payload, signature, "");
+
+    float total_mean_sum = 0.0;
+    int total_mean_count = 0;
+    float l5_mean_sum = 0.0;
+    int l5_mean_count = 0;
+    
+    if (!response.isNull() && response.containsKey("data") && response["data"].is<JsonArray>()) {
+        JsonArray history = response["data"].as<JsonArray>();
+        if (printToSerial) {
+            Serial.println("Trade History:");
+        }
+        String displayMessage = "Trades:\n";
+        int lineCount = 0;
+        if (history.size() > 0) {
+            for (JsonObject trade : history) {
+                String action = trade["action"].as<String>();
+                String priceStr = trade["price"].as<String>();
+                String amount = trade["amount"].as<String>();
+
+                if (action == "BUY") {
+                    float priceFloat = priceStr.toFloat();
+                    total_mean_sum += priceFloat;
+                    total_mean_count++;
+
+                    // For l5mean_price, we need the first 5 (or fewer) buy trades
+                    if (l5_mean_count < 5) {
+                        l5_mean_sum += priceFloat;
+                        l5_mean_count++;
+                    }
+                }
+
+                if (printToSerial) {
+                    Serial.printf("  %s %s at %s\n", action.c_str(), amount.c_str(), priceStr.c_str());
+                    if (lineCount < 3) { // Limit display to 3 lines on LCD for brevity
+                        displayMessage += action + " " + amount + "@" + priceStr + "\n";
+                        lineCount++;
+                    }
+                }
+            }
+            if (total_mean_count > 0) {
+                MEAN_INV_PRICE = total_mean_sum / total_mean_count;
+            } else {
+                MEAN_INV_PRICE = 0.0;
+            }
+            
+            if (l5_mean_count > 0) {
+                l5mean_price = l5_mean_sum / l5_mean_count;
+            } else {
+                l5mean_price = 0.0;
+            }
+
+        } else {
+            if (printToSerial) {
+                displayMessage += "No trades found.";
+            }
+            MEAN_INV_PRICE = 0.0;
+            l5mean_price = 0.0;
+        }
+        if (printToSerial) {
+            displayTextOnLCD(displayMessage, ST77XX_MAGENTA, ST77XX_BLACK, 2, 0, 20);
+        }
+    } else {
+        if (printToSerial) {
+            Serial.println("Failed to get trade history or response format is unexpected.");
+            displayTextOnLCD("History fetch failed!", ST77XX_RED, ST77XX_BLACK, 2, 0, 20);
+        }
+        MEAN_INV_PRICE = 0.0;
+        l5mean_price = 0.0;
+    }
+}
+
+
+// Function to cancel all open orders
+void cancelAllOrders(bool printToSerial = true) {
+    timeClient.update(); // Ensure timestamp is fresh
+    uint64_t nonce = (uint64_t)timeClient.getEpochTime() * 1000ULL; // Use ULL for unsigned long long literal
+
+    // Manually construct JSON string for the payload
+    String paramsJson = "{\"identity\": \"";
+    paramsJson += String(email);
+    paramsJson += "\", \"nonce\": ";
+    paramsJson += String(nonce);
+    paramsJson += "}";
+
+    String payload = base64UrlEncode(paramsJson);
+    String signature = generateHmacSha384(apiSecret, payload);
+
+    String url = String(baseUrl) + "/orders/all"; // Endpoint for cancelling all orders
+
+    if (printToSerial) {
+        displayTextOnLCD("Cancelling all orders...", ST77XX_YELLOW, ST77XX_BLACK, 2, 0, 20);
+        Serial.println("\nCancelling all orders...");
+    }
+
+    // Send the HTTP DELETE request
+    // The requestBody for DELETE /orders/all is typically empty, but we pass paramsJson for HMAC
+    StaticJsonDocument<1024> response = sendRequest("DELETE", url, payload, signature, paramsJson);
+
+    if (!response.isNull()) {
+        if (printToSerial) {
+            Serial.println("Cancel all orders response:");
+            serializeJsonPretty(response, Serial);
+            Serial.println();
+        }
+        String displayMessage = "Orders Cancelled:\n";
+        if (response.containsKey("success") && response["success"].as<bool>()) {
+            displayMessage += "SUCCESS";
+        } else if (response.containsKey("error")) {
+            displayMessage += "ERROR: " + response["error"].as<String>();
+        } else {
+            displayMessage += "Unknown Response";
+        }
+        if (printToSerial) {
+            displayTextOnLCD(displayMessage, ST77XX_BLUE, ST77XX_BLACK, 2, 0, 20);
+        }
+    } else {
+        if (printToSerial) {
+            Serial.println("Failed to cancel all orders or response was empty.");
+            displayTextOnLCD("Cancel failed!", ST77XX_RED, ST77XX_BLACK, 2, 0, 20);
+        }
+    }
+}
+
+void BLINK() {
+  digitalWrite(LED_BUILTIN, HIGH);  // turn the LED on (HIGH is the voltage level)
+  delay(100);                      // wait for a second
+  digitalWrite(LED_BUILTIN, LOW);   // turn the LED off by making the voltage LOW
+  delay(100);                      // wait for a second
+}
+
+
+
+void setup() {
+  Serial.begin(115200); // Initialize serial communication
+  Serial.println("ESP32-C6 Bitopro API Client - Combined Sketch");
+  pinMode(LED_BUILTIN, OUTPUT);
+  // Initialize the ST7789 display using the provided Display_ST7789 library
+  LCD_Init();
+  // Initialize Adafruit_ST7789 for text rendering
+  tft.init(LCD_WIDTH, LCD_HEIGHT); // Initialize ST7789 with width and height from Display_ST7789.h
+  tft.setRotation(3); // Set rotation based on your define
+  tft.fillScreen(ST77XX_BLACK); // Clear display with black background
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setTextSize(1);
+  tft.setCursor(0,0);
+
+
+  Serial.print("Connecting to WiFi ");
+  Serial.println(ssid);
+  displayTextOnLCD("Connecting to WiFi...", ST77XX_WHITE, ST77XX_BLACK, 2, 0, 20);
+  WiFi.begin(ssid, password); // Connect to WiFi network
+
+  // Wait until WiFi is connected
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected.");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+  displayTextOnLCD("WiFi connected.\nIP: " + WiFi.localIP().toString(), ST77XX_GREEN, ST77XX_BLACK, 2, 0, 20);
+  delay(2000);
+
+
+  Serial.println("Synchronizing time with NTP...");
+  displayTextOnLCD("Synchronizing time...", ST77XX_WHITE, ST77XX_BLACK, 2, 0, 20);
+  timeClient.begin(); // Start the NTP client
+  // Wait until time is synchronized
+  while (!timeClient.update()) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println("\nTime synchronized.");
+  String currentTime = timeClient.getFormattedTime();
+  Serial.print("Current UTC Time: ");
+  Serial.println(currentTime);
+  displayTextOnLCD("Time synchronized.\n" + currentTime, ST77XX_CYAN, ST77XX_BLACK, 2, 0, 20);
+  delay(2000);
+
+
+  // Construct the complete URL for placing orders once in setup
+  completeUrl = String(baseUrl) + endpoint;
+
+  // Get and display the current price at startup
+  GET_CUR_PRICE();
+
+  Serial.println("\nType 'B' for BUY, 'H' for History, 'Ba' for Balance, 'C' for Cancel All Orders. Auto-trading is active.");
+  Serial.println("Type 'S' for SELL."); // Added instruction for SELL
+  // displayTextOnLCD("Type 'B' to BUY\n'H' for History\n'Ba' for Balance\n'C' for Cancel All\n'S' for SELL\nAuto-trading Active", ST77XX_YELLOW, ST77XX_BLACK, 2, 0, 20); // Display instruction
+}
+
+void loop() {
+  displayTextOnLCD("LOADING", ST77XX_RED, ST77XX_BLACK, 6, 0, 70);
+
+  float fall_price = 0.0;
+  float PRICE_DIFF_RATIO = 0.0;
+  // Always update NTP client for accurate timestamps, even if not immediately used for a buy order
+  timeClient.update();
+
+  // Handle manual serial input first
+  if (Serial.available()) {
+    char incomingChar = Serial.read();
+    if (incomingChar == 'B' || incomingChar == 'b') {
+      Serial.println("\n'L' received! Displaying current price before sending BUY order...");
+      displayTextOnLCD("'L' received! Getting price...", ST77XX_YELLOW, ST77XX_BLACK, 2, 0, 20);
+      delay(1000); // Small delay to show the message
+      CUR_PRICE = GET_CUR_PRICE(); // Get current price for the manual buy
+      delay(1000); // Small delay to show the price
+      sendBuyOrder(TMP_QTY, CUR_PRICE); // Trigger the buy order with current price
+    } else if (incomingChar == 'S' || incomingChar == 's') { // New: Manual SELL
+      Serial.println("\n'S' received! Displaying balance and current price before sending SELL order...");
+      displayTextOnLCD("'S' received! Getting balance...", ST77XX_YELLOW, ST77XX_BLACK, 2, 0, 20);
+      delay(1000);
+      BTC_BALANCE = getBalance(true); // Get and display current BTC balance
+      CUR_PRICE = GET_CUR_PRICE(); // Get current price for the manual sell
+      delay(1000);
+      if (BTC_BALANCE >= 0.0001) { // Check if there's enough BTC to sell
+        Serial.printf("Selling %.4f BTC at %.2f\n", BTC_BALANCE, CUR_PRICE);
+        sendSellOrder(BTC_BALANCE, CUR_PRICE); // Trigger the sell order
+      } else {
+        Serial.println("Insufficient BTC balance to perform a sell order.");
+        displayTextOnLCD("Insufficient BTC\nfor SELL!", ST77XX_RED, ST77XX_BLACK, 2, 0, 20);
+      }
+    }
+    else if (incomingChar == 'H' || incomingChar == 'h') {
+      Serial.println("\n'F' received! Fetching trade history...");
+      getTradeHistoryMeanPrices(true); // Trigger the trade history function, print to serial
+    } else if (incomingChar == 'BA' || incomingChar == 'ba') {
+      Serial.println("\n'Ba' received! Fetching account balance...");
+      getBalance(true); // Trigger the account balance function, print to serial
+    } else if (incomingChar == 'C' || incomingChar == 'c') { // New: Cancel All Orders
+      Serial.println("\n'C' received! Attempting to cancel all open orders...");
+      cancelAllOrders(true); // Trigger cancel all orders, print to serial
+    }
+  }
+
+  // Trading logic, runs periodically
+  if (millis() - lastPriceUpdateTime >= priceUpdateInterval) {
+    CUR_PRICE = GET_CUR_PRICE(); // Fetch current price for trading decisions
+    lastPriceUpdateTime = millis(); // Reset the timer
+
+    // 1. Cancel all existing orders
+    cancelAllOrders(false); // Do not print to serial for auto-trading to avoid spamming
+
+    // 2. Get BTC Balance
+    BTC_BALANCE = getBalance(false); // Do not print to serial for auto-trading
+
+    // 3. Conditional BUY based on balance
+    if (BTC_BALANCE < 0.0001) { // Adjusted threshold for Arduino float precision
+        Serial.println("BTC Balance too low. Initiating BUY order...");
+        sendBuyOrder(TMP_QTY, CUR_PRICE); // Uses predefined price/amount from sendBuyOrder()
+    }
+
+    // 4. Get historical mean buy price and l5mean_price
+    getTradeHistoryMeanPrices(false); // Do not print to serial for auto-trading
+
+    if (CUR_PRICE == 0) {
+        Serial.println("Could not fetch current price. Skipping auto-trading action.");
+    } else {
+        // Calculate fall_price using l5mean_price
+        if (l5mean_price != 0.0) { // Avoid division by zero
+            fall_price = (CUR_PRICE - l5mean_price) / l5mean_price * 100;
+        } else {
+            Serial.println("l5mean_price is zero, cannot calculate fall_price.");
+        }
+        if (MEAN_INV_PRICE != 0.0) { // Avoid division by zero
+            PRICE_DIFF_RATIO = (CUR_PRICE - MEAN_INV_PRICE) / MEAN_INV_PRICE * 100;
+        } else {
+            Serial.println("MEAN_INV_PRICE is zero, cannot calculate PRICE_DIFF_RATIO.");
+        }
+
+        if (l5mean_price != 0 && fall_price <= -1.0) { // If price drops more than 1% below l5mean
+            Serial.println("BELOW_MEAN - Considering BUY action (Auto)");
+            sendBuyOrder(TMP_QTY, CUR_PRICE); // Trigger a buy order
+        } else if (MEAN_INV_PRICE != 0 && PRICE_DIFF_RATIO >= 1.0) { // If price rises more than 3% above overall mean
+            if (BTC_BALANCE >= 0.0001) { // Only sell if there's significant BTC
+                Serial.printf("Above Mean - Considering SELL action (Auto). Selling %.4f BTC at %.2f\n", BTC_BALANCE, CUR_PRICE);
+                sendSellOrder(BTC_BALANCE, CUR_PRICE); // Call the new sell function
+            } else {
+                Serial.println("Auto-SELL skipped: Insufficient BTC balance.");
+            }
+        } else {
+            Serial.println("No auto-trading action taken.");
+        }
+    }
+  }
+
+  // Daily 7 AM buy logic
+  int currentHour = timeClient.getHours(); // Get the current hour (0-23)
+  if (currentHour == 7 && PRICE_DIFF_RATIO < 0 && lastBuyHour != 7) {
+    // Serial.println("It's 7 AM and PRICE_DIFF_RATIO is negative. Triggering daily BUY action.");
+    sendBuyOrder(TMP_QTY, CUR_PRICE); // Trigger a buy order
+    lastBuyHour = 7; // Mark that a buy action was triggered for this hour
+    displayTextOnLCD("Trigger Daily Buy " + String(CUR_PRICE), ST77XX_YELLOW, ST77XX_BLACK, 3, 0, 60);
+    delay(10000);
+  } else if (currentHour != 7) {
+    // Reset lastBuyHour if the hour changes, so it can trigger again next day at 7 AM
+    lastBuyHour = 0; 
+    displayTextOnLCD("Reset Daily Buy ", ST77XX_YELLOW, ST77XX_BLACK, 3, 0, 60);
+  }
+
+  String STR = "BAL " + String(BTC_BALANCE, 5) + "\n" +
+                "CUR " + String(CUR_PRICE, 0) + "\n" +
+                "L5M " + String(l5mean_price, 0) + "\n" +
+                "INV " + String(MEAN_INV_PRICE, 0) + "\n" +
+                "AVG " + String(PRICE_DIFF_RATIO, 1) + " L5M " + String(fall_price, 1) + "\n";
+  tft.setTextWrap(true); // Wrap text if it exceeds screen width
+  tft.setCursor(0, 20);        // Set cursor position
+  tft.setTextColor(ST77XX_RED);    // Set text color
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setTextSize(3);      // Set text size
+  tft.print(STR);            // Print the text  
+  for (int i = 5; i >= 0; i--) {
+    BLINK();
+    tft.setCursor(20*(5-i), 140);        // Set cursor position
+    tft.setTextColor(ST77XX_RED);    // Set text color
+    tft.setTextSize(3);      // Set text size
+    tft.print(String(i));  
+    delay(1000); // Wait for 1 second
+  }
+  tft.fillScreen(ST77XX_BLACK); // Clear the screen with the background color
+}
