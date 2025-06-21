@@ -1,4 +1,5 @@
 this code is based on esp32 c6 1.47 lcd from waveshare https://www.waveshare.com/esp32-c6-lcd-1.47.htm
+![image](https://github.com/user-attachments/assets/62232da8-7635-490d-a891-14314a5c0454)
 
 arduino IDE version: 2.3.6 https://www.arduino.cc/
 
