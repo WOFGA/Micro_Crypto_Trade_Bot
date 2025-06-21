@@ -13,3 +13,5 @@ copy the txt file to arduino IDE and edit
 3. apiKey
 4. apiSecret
 5. email
+6. adjust fall_price ratio for buy in criteria
+7. adjust PRICE_DIFF_RATIO for sell out criteria
